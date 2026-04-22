@@ -53,11 +53,101 @@ const sqsClient = new SQSClient({
 });
 
 // ===== NOTIFICATION PROCESSING =====
-async function processNotification(messageBody: any) {
-  const { userId, message, data } = messageBody;
+// FCM multicast limit is 500 tokens per call.
+const FCM_MULTICAST_LIMIT = 500;
 
-  if (!userId || !message?.title) {
-    console.warn(`⚠️ Invalid message payload: ${JSON.stringify(messageBody)}`);
+function chunk<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
+  return out;
+}
+
+async function sendToTokens(
+  tokens: string[],
+  title: string,
+  body: string,
+  data: Record<string, string> = {},
+  label: string
+) {
+  if (!tokens.length) {
+    console.log(`ℹ️ ${label}: no tokens.`);
+    return;
+  }
+
+  // Firebase data payload values MUST be strings.
+  const stringData: Record<string, string> = {};
+  for (const [k, v] of Object.entries(data)) stringData[k] = String(v);
+
+  const batches = chunk(tokens, FCM_MULTICAST_LIMIT);
+  let successCount = 0;
+  const invalidTokens: string[] = [];
+
+  for (const batchTokens of batches) {
+    const multicastMessage: MulticastMessage = {
+      tokens: batchTokens,
+      notification: { title, body },
+      data: stringData,
+    };
+    try {
+      const batchResponse = await getMessaging().sendEachForMulticast(
+        multicastMessage
+      );
+      successCount += batchResponse.successCount;
+      batchResponse.responses.forEach((resp, idx) => {
+        if (
+          !resp.success &&
+          [
+            "messaging/registration-token-not-registered",
+            "messaging/invalid-registration-token",
+          ].includes(resp.error?.code || "")
+        ) {
+          invalidTokens.push(batchTokens[idx]);
+        }
+      });
+    } catch (err) {
+      console.error(`❌ FCM batch failed (${label}):`, err);
+    }
+  }
+
+  console.log(`📨 ${label}: ${successCount}/${tokens.length} sent.`);
+
+  if (invalidTokens.length) {
+    await db.UserDevice.destroy({ where: { device_token: invalidTokens } });
+    console.log(`🧹 ${label}: removed ${invalidTokens.length} invalid tokens.`);
+  }
+}
+
+async function processNotification(messageBody: any) {
+  const { type, userId, message, data } = messageBody;
+
+  if (!message?.title) {
+    console.warn(`⚠️ Invalid payload (no title): ${JSON.stringify(messageBody)}`);
+    return;
+  }
+
+  // ===== Broadcast to all users =====
+  if (type === "broadcast") {
+    const devices = await db.UserDevice.findAll({
+      where: { is_active: true },
+      attributes: ["device_token"],
+      raw: true,
+    });
+    const tokens = devices.map((d) => d.device_token);
+    await sendToTokens(
+      tokens,
+      message.title,
+      message.body ?? "",
+      data || {},
+      "broadcast"
+    );
+    return;
+  }
+
+  // ===== Single-user notification (existing behavior) =====
+  if (!userId) {
+    console.warn(`⚠️ Invalid payload (no userId): ${JSON.stringify(messageBody)}`);
     return;
   }
 
@@ -66,51 +156,14 @@ async function processNotification(messageBody: any) {
     attributes: ["device_token"],
     raw: true,
   });
-
-  if (!userDevices.length) {
-    console.log(`ℹ️ No active devices for user ${userId}`);
-    return;
-  }
-
   const tokens = userDevices.map((d) => d.device_token);
-  const multicastMessage: MulticastMessage = {
+  await sendToTokens(
     tokens,
-    notification: {
-      title: message.title,
-      body: message.body ?? "",
-    },
-    data: data || {},
-  };
-
-  try {
-    const batchResponse = await getMessaging().sendEachForMulticast(
-      multicastMessage
-    );
-    console.log(
-      `📨 User ${userId}: ${batchResponse.successCount}/${tokens.length} sent.`
-    );
-
-    const invalidTokens = batchResponse.responses
-      .map((resp, idx) =>
-        !resp.success &&
-        [
-          "messaging/registration-token-not-registered",
-          "messaging/invalid-registration-token",
-        ].includes(resp.error?.code || "")
-          ? tokens[idx]
-          : null
-      )
-      .filter(Boolean) as string[];
-
-    if (invalidTokens.length) {
-      await db.UserDevice.destroy({
-        where: { device_token: invalidTokens },
-      });
-      console.log(`🧹 Removed ${invalidTokens.length} invalid tokens.`);
-    }
-  } catch (err) {
-    console.error(`❌ Failed to send notification for user ${userId}:`, err);
-  }
+    message.title,
+    message.body ?? "",
+    data || {},
+    `user ${userId}`
+  );
 }
 
 // ===== SQS LISTENER =====
